@@ -1,0 +1,261 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Translation Booth</title>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      background: #111;
+      color: #eee;
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      min-height: 100vh;
+      gap: 28px;
+      padding: 24px;
+    }
+
+    h1 {
+      font-size: 1rem;
+      font-weight: 400;
+      letter-spacing: 0.2em;
+      text-transform: uppercase;
+      color: #888;
+    }
+
+    /* Status indicator circle */
+    #indicator {
+      width: 80px;
+      height: 80px;
+      border-radius: 50%;
+      background: #444;
+      transition: background 0.3s;
+    }
+
+    #indicator.live {
+      background: #e53e3e;
+      animation: pulse 1.4s ease-in-out infinite;
+    }
+
+    @keyframes pulse {
+      0%, 100% { box-shadow: 0 0 0 0 rgba(229,62,62,0.6); }
+      50%       { box-shadow: 0 0 0 20px rgba(229,62,62,0); }
+    }
+
+    /* Main button */
+    #toggleBtn {
+      padding: 16px 48px;
+      font-size: 1.1rem;
+      font-weight: 600;
+      letter-spacing: 0.05em;
+      border: none;
+      border-radius: 8px;
+      cursor: pointer;
+      background: #2d7d46;
+      color: #fff;
+      transition: background 0.2s, transform 0.1s;
+      min-width: 180px;
+    }
+
+    #toggleBtn:hover { background: #38954f; }
+    #toggleBtn:active { transform: scale(0.97); }
+    #toggleBtn.live { background: #c53030; }
+    #toggleBtn.live:hover { background: #e53e3e; }
+    #toggleBtn:disabled { background: #444; cursor: not-allowed; opacity: 0.6; }
+
+    /* Status text */
+    #statusText {
+      font-size: 0.85rem;
+      color: #888;
+      letter-spacing: 0.05em;
+    }
+
+    /* Mic level meter */
+    #meterWrap {
+      width: 240px;
+      height: 8px;
+      background: #333;
+      border-radius: 4px;
+      overflow: hidden;
+    }
+
+    #meterBar {
+      height: 100%;
+      width: 0%;
+      background: linear-gradient(to right, #38a169, #e53e3e);
+      border-radius: 4px;
+      transition: width 0.05s linear;
+    }
+
+    /* Listener count */
+    #listenerCount {
+      font-size: 0.8rem;
+      color: #666;
+    }
+
+    #listenerCount span {
+      color: #aaa;
+      font-weight: 600;
+    }
+  </style>
+</head>
+<body>
+
+  <h1>Translation Booth</h1>
+
+  <div id="indicator"></div>
+
+  <button id="toggleBtn" disabled>Go Live</button>
+
+  <div id="statusText">Connecting...</div>
+
+  <div id="meterWrap">
+    <div id="meterBar"></div>
+  </div>
+
+  <div id="listenerCount">Listeners: <span id="listenerNum">0</span></div>
+
+  <script>
+    const indicator   = document.getElementById('indicator');
+    const toggleBtn   = document.getElementById('toggleBtn');
+    const statusText  = document.getElementById('statusText');
+    const meterBar    = document.getElementById('meterBar');
+    const listenerNum = document.getElementById('listenerNum');
+
+    let ws = null;
+    let mediaRecorder = null;
+    let audioStream = null;
+    let analyser = null;
+    let animFrame = null;
+    let isLive = false;
+    let reconnectTimer = null;
+
+    // ── WebSocket ──────────────────────────────────────────────────
+    function connect() {
+      const protocol = window.location.protocol === 'https:' ? 'wss' : 'ws';
+      ws = new WebSocket(`${protocol}://${window.location.host}`);
+      ws.binaryType = 'arraybuffer';
+
+      ws.addEventListener('open', () => {
+        ws.send(JSON.stringify({ type: 'booth' }));
+        statusText.textContent = 'Connected';
+        toggleBtn.disabled = false;
+        clearTimeout(reconnectTimer);
+      });
+
+      ws.addEventListener('message', (evt) => {
+        try {
+          const msg = JSON.parse(evt.data);
+          if (msg.type === 'listeners') {
+            listenerNum.textContent = msg.count;
+          }
+        } catch (e) { /* binary or unexpected */ }
+      });
+
+      ws.addEventListener('close', () => {
+        statusText.textContent = 'Disconnected — reconnecting...';
+        toggleBtn.disabled = true;
+        if (isLive) stopLive();
+        scheduleReconnect();
+      });
+
+      ws.addEventListener('error', () => {
+        ws.close();
+      });
+    }
+
+    function scheduleReconnect() {
+      clearTimeout(reconnectTimer);
+      reconnectTimer = setTimeout(connect, 3000);
+    }
+
+    // ── Go Live / Stop ──────────────────────────────────────────────
+    toggleBtn.addEventListener('click', () => {
+      if (!isLive) {
+        startLive();
+      } else {
+        stopLive();
+      }
+    });
+
+    async function startLive() {
+      try {
+        audioStream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
+      } catch (err) {
+        statusText.textContent = 'Microphone access denied';
+        return;
+      }
+
+      // Choose best supported mime type
+      const mimeType = MediaRecorder.isTypeSupported('audio/webm;codecs=opus')
+        ? 'audio/webm;codecs=opus'
+        : 'audio/webm';
+
+      mediaRecorder = new MediaRecorder(audioStream, { mimeType });
+
+      mediaRecorder.addEventListener('dataavailable', (evt) => {
+        if (evt.data && evt.data.size > 0 && ws && ws.readyState === WebSocket.OPEN) {
+          ws.send(evt.data);
+        }
+      });
+
+      mediaRecorder.start(250); // 250ms chunks
+
+      setupMeter(audioStream);
+
+      isLive = true;
+      indicator.classList.add('live');
+      toggleBtn.textContent = 'Stop';
+      toggleBtn.classList.add('live');
+      statusText.textContent = 'Live';
+    }
+
+    function stopLive() {
+      if (mediaRecorder && mediaRecorder.state !== 'inactive') {
+        mediaRecorder.stop();
+      }
+      if (audioStream) {
+        audioStream.getTracks().forEach(t => t.stop());
+        audioStream = null;
+      }
+      cancelAnimationFrame(animFrame);
+      meterBar.style.width = '0%';
+
+      isLive = false;
+      indicator.classList.remove('live');
+      toggleBtn.textContent = 'Go Live';
+      toggleBtn.classList.remove('live');
+      statusText.textContent = 'Connected';
+    }
+
+    // ── Mic level meter ─────────────────────────────────────────────
+    function setupMeter(stream) {
+      const audioCtx = new AudioContext();
+      const source = audioCtx.createMediaStreamSource(stream);
+      analyser = audioCtx.createAnalyser();
+      analyser.fftSize = 512;
+      source.connect(analyser);
+
+      const data = new Uint8Array(analyser.frequencyBinCount);
+
+      function draw() {
+        animFrame = requestAnimationFrame(draw);
+        analyser.getByteFrequencyData(data);
+        let sum = 0;
+        for (let i = 0; i < data.length; i++) sum += data[i];
+        const avg = sum / data.length;
+        meterBar.style.width = Math.min(100, (avg / 128) * 100) + '%';
+      }
+      draw();
+    }
+
+    // ── Init ────────────────────────────────────────────────────────
+    connect();
+  </script>
+</body>
+</html>
